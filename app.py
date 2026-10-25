@@ -718,8 +718,8 @@ def not_found(_):
 # =========================================================
 # MAIN
 # =========================================================
+init_db()
+
 if __name__ == "__main__":
-    init_db()
-    # Render assigns a PORT dynamically; we default to 5000 locally
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
