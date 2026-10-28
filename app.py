@@ -28,10 +28,6 @@ app.secret_key = SECRET_KEY
 # =========================================================
 # DATABASE HELPERS
 # =========================================================
-def hash_password(pw: str) -> str:
-    return hashlib.sha256(pw.encode()).hexdigest()
-
-
 def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(DB_FILE)
@@ -40,686 +36,643 @@ def get_db():
 
 
 @app.teardown_appcontext
-def close_db(_exc):
+def close_db(exception=None):
     db = g.pop("db", None)
     if db is not None:
         db.close()
 
 
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
+    db = sqlite3.connect(DB_FILE)
+    cur = db.cursor()
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
-            role TEXT NOT NULL CHECK(role IN ('admin','department')),
-            department TEXT
+            role TEXT NOT NULL DEFAULT 'user',
+            department TEXT DEFAULT ''
         )
     """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS requisitions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            requester TEXT NOT NULL,
-            department TEXT NOT NULL,
-            item TEXT NOT NULL,
-            quantity INTEGER NOT NULL CHECK(quantity > 0),
-            justification TEXT,
-            status TEXT NOT NULL DEFAULT 'PENDING'
-                CHECK(status IN ('PENDING','APPROVED','REJECTED','FULFILLED')),
-            created_at TEXT NOT NULL,
-            decided_at TEXT,
-            decided_by TEXT
+            item_name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            quantity INTEGER NOT NULL DEFAULT 1,
+            department TEXT DEFAULT '',
+            requested_by TEXT DEFAULT '',
+            priority TEXT DEFAULT 'Normal',
+            status TEXT DEFAULT 'Pending',
+            created_at TEXT NOT NULL
         )
     """)
 
-    # Seed default admin
-    cur.execute("SELECT COUNT(*) FROM users WHERE role='admin'")
-    if cur.fetchone()[0] == 0:
+    # Default admin
+    cur.execute("SELECT * FROM users WHERE username = ?", ("admin",))
+    if not cur.fetchone():
         cur.execute(
-            "INSERT INTO users (username, password, role, department) VALUES (?,?,?,?)",
-            ("admin", hash_password("admin123"), "admin", None),
+            "INSERT INTO users (username, password, role, department) VALUES (?, ?, ?, ?)",
+            ("admin", hash_password("admin123"), "admin", "Administration"),
         )
 
-    conn.commit()
-    conn.close()
-
-
-# =========================================================
-# DB QUERIES
-# =========================================================
-def db_login(username, password):
-    row = get_db().execute(
-        "SELECT * FROM users WHERE username=? AND password=?",
-        (username, hash_password(password)),
-    ).fetchone()
-    return dict(row) if row else None
-
-
-def db_register(username, password, role, department=None):
-    try:
-        cur = get_db()
-        cur.execute(
-            "INSERT INTO users (username, password, role, department) VALUES (?,?,?,?)",
-            (username, hash_password(password), role, department),
-        )
-        cur.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-
-
-def db_create_requisition(requester, department, item, qty, justification):
-    db = get_db()
-    db.execute(
-        """INSERT INTO requisitions
-           (requester, department, item, quantity, justification, status, created_at)
-           VALUES (?,?,?,?,?, 'PENDING', ?)""",
-        (requester, department, item, qty, justification,
-         datetime.now().strftime("%Y-%m-%d %H:%M")),
-    )
     db.commit()
-
-
-def db_list_requisitions(department=None, status=None):
-    q = "SELECT * FROM requisitions"
-    clauses, params = [], []
-    if department:
-        clauses.append("department=?")
-        params.append(department)
-    if status:
-        clauses.append("status=?")
-        params.append(status)
-    if clauses:
-        q += " WHERE " + " AND ".join(clauses)
-    q += " ORDER BY id DESC"
-    return [dict(r) for r in get_db().execute(q, params).fetchall()]
-
-
-def db_get_requisition(req_id):
-    row = get_db().execute("SELECT * FROM requisitions WHERE id=?", (req_id,)).fetchone()
-    return dict(row) if row else None
-
-
-def db_set_status(req_id, status, admin_username):
-    db = get_db()
-    db.execute(
-        "UPDATE requisitions SET status=?, decided_at=?, decided_by=? WHERE id=?",
-        (status, datetime.now().strftime("%Y-%m-%d %H:%M"), admin_username, req_id),
-    )
-    db.commit()
-
-
-def db_stats(department=None):
-    # Using reliable Python counting instead of SQLite COUNT
-    reqs = db_list_requisitions(department=department)
-    out = {"PENDING": 0, "APPROVED": 0, "REJECTED": 0, "FULFILLED": 0}
-    for r in reqs:
-        if r["status"] in out:
-            out[r["status"]] += 1
-    return out
+    db.close()
 
 
 # =========================================================
-# AUTH DECORATORS
+# AUTH HELPERS
 # =========================================================
-def current_user():
-    return session.get("user")
-
-
 def login_required(f):
     @wraps(f)
-    def wrapper(*a, **kw):
-        if not current_user():
+    def wrapper(*args, **kwargs):
+        if "user_id" not in session:
             flash("Please log in first.", "warning")
             return redirect(url_for("login"))
-        return f(*a, **kw)
+        return f(*args, **kwargs)
     return wrapper
 
 
 def admin_required(f):
     @wraps(f)
-    def wrapper(*a, **kw):
-        u = current_user()
-        if not u or u["role"] != "admin":
+    def wrapper(*args, **kwargs):
+        if session.get("role") != "admin":
             abort(403)
-        return f(*a, **kw)
+        return f(*args, **kwargs)
     return wrapper
 
 
 # =========================================================
-# BASE TEMPLATE
+# TEMPLATES
 # =========================================================
-BASE_HTML = """
+BASE_TEMPLATE = """
 <!doctype html>
-<html lang="en">
+<html>
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}Requisition System{% endblock %}</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
-  <style>
-    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:#f5f7fa; }
-    .card { border-radius: .75rem; }
-    .stat-card { transition: transform .15s ease, box-shadow .15s ease; border-left:4px solid transparent !important; }
-    .stat-card:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(0,0,0,.08) !important; }
-    .stat-warning   { border-left-color:#ffc107 !important; }
-    .stat-success   { border-left-color:#198754 !important; }
-    .stat-danger    { border-left-color:#dc3545 !important; }
-    .stat-primary   { border-left-color:#0d6efd !important; }
-    .badge.status-pending   { background-color:#fff3cd; color:#664d03; }
-    .badge.status-approved  { background-color:#d1e7dd; color:#0f5132; }
-    .badge.status-rejected  { background-color:#f8d7da; color:#842029; }
-    .badge.status-fulfilled { background-color:#cfe2ff; color:#084298; }
-    .btn { border-radius:.5rem; }
-    .btn i, .navbar-brand i, .badge i { vertical-align: middle; }
-    .table thead th { font-size:.78rem; text-transform:uppercase; letter-spacing:.03em; color:#6c757d; }
-    footer { font-size:.8rem; }
-  </style>
+<meta charset="utf-8">
+<title>Requisition System</title>
+<style>
+    body { font-family: Arial, Helvetica, sans-serif; margin: 0; background: #f4f6f8; color: #222; }
+    nav { background: #2c3e50; padding: 12px 20px; display: flex; gap: 18px; align-items: center; }
+    nav a { color: #fff; text-decoration: none; padding: 6px 10px; border-radius: 4px; }
+    nav a:hover { background: #34495e; }
+    nav .spacer { flex: 1; }
+    .container { max-width: 1200px; margin: 20px auto; padding: 0 20px; }
+    .flash { padding: 10px 14px; border-radius: 4px; margin-bottom: 10px; }
+    .flash.success { background: #d4edda; color: #155724; }
+    .flash.warning { background: #fff3cd; color: #856404; }
+    .flash.danger { background: #f8d7da; color: #721c24; }
+    table { width: 100%; border-collapse: collapse; background: #fff; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid #e0e0e0; text-align: left; font-size: 14px; }
+    th { background: #ecf0f1; }
+    input, select, textarea { padding: 7px 9px; border: 1px solid #bbb; border-radius: 4px; font-size: 14px; box-sizing: border-box; }
+    button { padding: 8px 14px; border: none; border-radius: 4px; background: #2980b9; color: #fff; cursor: pointer; font-size: 14px; }
+    button:hover { background: #216a94; }
+    button.secondary { background: #7f8c8d; }
+    button.danger { background: #c0392b; }
+    .filter-bar { background: #fff; padding: 14px; border-radius: 6px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    .filter-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; align-items: end; }
+    .filter-grid label { display: block; font-size: 12px; font-weight: bold; color: #555; margin-bottom: 3px; }
+    .filter-grid input, .filter-grid select { width: 100%; }
+    .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; }
+    .badge.Pending { background: #fef3c7; color: #92400e; }
+    .badge.Approved { background: #d1fae5; color: #065f46; }
+    .badge.Rejected { background: #fee2e2; color: #991b1b; }
+    .badge.Normal { background: #e5e7eb; color: #374151; }
+    .badge.High { background: #ffedd5; color: #9a3412; }
+    .badge.Urgent { background: #fee2e2; color: #b91c1c; }
+    .result-count { font-size: 13px; color: #666; margin-bottom: 8px; }
+</style>
 </head>
 <body>
-
-<nav class="navbar navbar-expand-lg navbar-dark bg-primary shadow-sm">
-  <div class="container">
-    <a class="navbar-brand fw-bold" href="{{ url_for('dashboard') if user else url_for('login') }}">
-      <i class="bi bi-clipboard-check"></i> Requisition System
-    </a>
-    <div class="ms-auto d-flex align-items-center">
-      {% if user %}
-        <span class="navbar-text me-3 text-white">
-          <i class="bi bi-person-circle"></i> {{ user.username }}
-          <span class="badge bg-light text-primary ms-1">{{ user.role }}</span>
-        </span>
-        {% if user.role == 'admin' %}
-          <a href="{{ url_for('admin_requisitions') }}" class="btn btn-outline-light btn-sm me-1">
-            <i class="bi bi-shield-check"></i> Admin
-          </a>
-        {% endif %}
-        <a href="{{ url_for('dashboard') }}" class="btn btn-outline-light btn-sm me-1">
-          <i class="bi bi-speedometer2"></i> Dashboard
-        </a>
-        <a href="{{ url_for('logout') }}" class="btn btn-light btn-sm">
-          <i class="bi bi-box-arrow-right"></i> Logout
-        </a>
-      {% endif %}
-    </div>
-  </div>
+<nav>
+    <a href="{{ url_for('index') }}">Requisitions</a>
+    {% if session.get('role') == 'admin' %}
+    <a href="{{ url_for('users') }}">Users</a>
+    {% endif %}
+    <span class="spacer"></span>
+    {% if session.get('username') %}
+        <span style="color:#bdc3c7;">Signed in as <b>{{ session.username }}</b></span>
+        <a href="{{ url_for('logout') }}">Logout</a>
+    {% else %}
+        <a href="{{ url_for('login') }}">Login</a>
+    {% endif %}
 </nav>
-
-<div class="container py-4">
-  {% with messages = get_flashed_messages(with_categories=true) %}
-    {% for category, msg in messages %}
-      <div class="alert alert-{{ category }} alert-dismissible fade show shadow-sm">
-        {{ msg }}
-        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-      </div>
-    {% endfor %}
-  {% endwith %}
-
-  {% if error_title %}
-    <div class="text-center py-5">
-      <h1 class="display-5">{{ error_title }}</h1>
-      <p class="text-muted">{{ error_msg }}</p>
-      <a href="{{ url_for('dashboard') if user else url_for('login') }}" class="btn btn-primary">
-        <i class="bi bi-house"></i> Go Home
-      </a>
-    </div>
-  {% else %}
+<div class="container">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for cat, msg in messages %}
+        <div class="flash {{ cat }}">{{ msg }}</div>
+      {% endfor %}
+    {% endwith %}
     {% block content %}{% endblock %}
-  {% endif %}
 </div>
-
-<footer class="text-center text-muted small py-3">
-  Requisition System &copy; 2026
-</footer>
-
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
 """
 
-
-# =========================================================
-# PAGE TEMPLATES
-# =========================================================
-LOGIN_HTML = BASE_HTML.replace("{% block content %}{% endblock %}", """
-<div class="row justify-content-center">
-  <div class="col-md-5 col-lg-4">
-    <div class="card shadow border-0 mt-5">
-      <div class="card-body p-4">
-        <h3 class="text-center mb-1">Welcome</h3>
-        <p class="text-center text-muted mb-4">Sign in to continue</p>
-        <form method="post">
-          <div class="mb-3">
-            <label class="form-label">Username</label>
-            <input type="text" name="username" class="form-control" required autofocus>
-          </div>
-          <div class="mb-3">
-            <label class="form-label">Password</label>
-            <input type="password" name="password" class="form-control" required>
-          </div>
-          <button class="btn btn-primary w-100">
-            <i class="bi bi-box-arrow-in-right"></i> Sign in
-          </button>
-        </form>
-        <p class="text-center small mt-3 mb-0">
-          No account? <a href="{{ url_for('register') }}">Register here</a>
-        </p>
-      </div>
-    </div>
-    <p class="text-center text-muted small mt-3">Default admin: <code>admin / admin123</code></p>
-  </div>
-</div>
+LOGIN_TEMPLATE = BASE_TEMPLATE.replace("{% block content %}{% endblock %}", """
+{% block content %}
+<h2>Login</h2>
+<form method="post" style="max-width:320px;">
+    <label>Username</label><br>
+    <input name="username" required style="width:100%;"><br><br>
+    <label>Password</label><br>
+    <input name="password" type="password" required style="width:100%;"><br><br>
+    <button type="submit">Sign In</button>
+</form>
+<p style="color:#777;font-size:13px;">Default: <b>admin / admin123</b></p>
+{% endblock %}
 """)
 
-REGISTER_HTML = BASE_HTML.replace("{% block content %}{% endblock %}", """
-<div class="row justify-content-center">
-  <div class="col-md-6 col-lg-5">
-    <div class="card shadow border-0 mt-4">
-      <div class="card-body p-4">
-        <h3 class="mb-3">Create account</h3>
-        <form method="post">
-          <div class="mb-3">
-            <label class="form-label">Username</label>
-            <input type="text" name="username" class="form-control" required>
-          </div>
-          <div class="mb-3">
-            <label class="form-label">Password</label>
-            <input type="password" name="password" class="form-control" required>
-          </div>
-          <div class="mb-3">
-            <label class="form-label">Role</label>
-            <select name="role" id="role-select" class="form-select" required>
-              <option value="department">Department user</option>
-              <option value="admin">Admin</option>
+INDEX_TEMPLATE = BASE_TEMPLATE.replace("{% block content %}{% endblock %}", """
+{% block content %}
+<h2>Requisitions</h2>
+
+<form method="get" class="filter-bar">
+    <div class="filter-grid">
+        <div>
+            <label>Item Name</label>
+            <input name="f_item" value="{{ f.item }}" placeholder="Search item name…">
+        </div>
+        <div>
+            <label>Description</label>
+            <input name="f_desc" value="{{ f.desc }}" placeholder="Search description…">
+        </div>
+        <div>
+            <label>Department</label>
+            <select name="f_dept">
+                <option value="">All departments</option>
+                {% for d in options.departments %}
+                <option value="{{ d }}" {% if f.dept == d %}selected{% endif %}>{{ d }}</option>
+                {% endfor %}
             </select>
-          </div>
-          <div class="mb-3" id="dept-group">
-            <label class="form-label">Department</label>
-            <input type="text" name="department" class="form-control" placeholder="e.g. IT, HR, Finance">
-          </div>
-          <button class="btn btn-success w-100">
-            <i class="bi bi-person-plus"></i> Register
-          </button>
-        </form>
-        <p class="text-center small mt-3 mb-0"><a href="{{ url_for('login') }}">Back to login</a></p>
-      </div>
+        </div>
+        <div>
+            <label>Requested By</label>
+            <select name="f_requester">
+                <option value="">All requesters</option>
+                {% for r in options.requesters %}
+                <option value="{{ r }}" {% if f.requester == r %}selected{% endif %}>{{ r }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div>
+            <label>Status</label>
+            <select name="f_status">
+                <option value="">All statuses</option>
+                {% for s in options.statuses %}
+                <option value="{{ s }}" {% if f.status == s %}selected{% endif %}>{{ s }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div>
+            <label>Priority</label>
+            <select name="f_priority">
+                <option value="">All priorities</option>
+                {% for p in options.priorities %}
+                <option value="{{ p }}" {% if f.priority == p %}selected{% endif %}>{{ p }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div>
+            <label>Min Qty</label>
+            <input name="f_qty_min" type="number" min="0" value="{{ f.qty_min }}">
+        </div>
+        <div>
+            <label>Max Qty</label>
+            <input name="f_qty_max" type="number" min="0" value="{{ f.qty_max }}">
+        </div>
+        <div>
+            <label>Created From</label>
+            <input name="f_date_from" type="date" value="{{ f.date_from }}">
+        </div>
+        <div>
+            <label>Created To</label>
+            <input name="f_date_to" type="date" value="{{ f.date_to }}">
+        </div>
+        <div>
+            <label>Sort By</label>
+            <select name="sort">
+                {% for key, label in sort_options %}
+                <option value="{{ key }}" {% if f.sort == key %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div>
+            <label>Order</label>
+            <select name="order">
+                <option value="asc" {% if f.order == 'asc' %}selected{% endif %}>Ascending</option>
+                <option value="desc" {% if f.order == 'desc' %}selected{% endif %}>Descending</option>
+            </select>
+        </div>
+        <div style="display:flex;gap:6px;">
+            <button type="submit">Filter</button>
+            <a href="{{ url_for('index') }}" style="text-decoration:none;"><button type="button" class="secondary">Reset</button></a>
+        </div>
     </div>
-  </div>
+</form>
+
+<div class="result-count">
+    Showing <b>{{ requisitions|length }}</b> result(s)
+    {% if has_filters %}(filters applied){% endif %}
 </div>
-<script>
-  const roleEl = document.getElementById('role-select');
-  const deptGroup = document.getElementById('dept-group');
-  function toggleDept(){ deptGroup.style.display = roleEl.value === 'department' ? '' : 'none'; }
-  roleEl.addEventListener('change', toggleDept); toggleDept();
-</script>
+
+{% if session.get('role') == 'admin' or session.get('user_id') %}
+<p>
+    <a href="{{ url_for('add_requisition') }}"><button>+ New Requisition</button></a>
+</p>
+{% endif %}
+
+<table>
+    <thead>
+        <tr>
+            <th>#</th>
+            <th>Item</th>
+            <th>Description</th>
+            <th>Qty</th>
+            <th>Department</th>
+            <th>Requested By</th>
+            <th>Priority</th>
+            <th>Status</th>
+            <th>Created</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+    {% for r in requisitions %}
+        <tr>
+            <td>{{ r.id }}</td>
+            <td>{{ r.item_name }}</td>
+            <td>{{ r.description }}</td>
+            <td>{{ r.quantity }}</td>
+            <td>{{ r.department }}</td>
+            <td>{{ r.requested_by }}</td>
+            <td><span class="badge {{ r.priority }}">{{ r.priority }}</span></td>
+            <td><span class="badge {{ r.status }}">{{ r.status }}</span></td>
+            <td>{{ r.created_at }}</td>
+            <td>
+                <div class="actions">
+                    <a href="{{ url_for('edit_requisition', req_id=r.id) }}"><button class="secondary">Edit</button></a>
+                    {% if session.get('role') == 'admin' %}
+                    <form method="post" action="{{ url_for('delete_requisition', req_id=r.id) }}" onsubmit="return confirm('Delete this requisition?');">
+                        <button class="danger">Delete</button>
+                    </form>
+                    {% endif %}
+                </div>
+            </td>
+        </tr>
+    {% else %}
+        <tr><td colspan="10" style="text-align:center;color:#888;">No requisitions found.</td></tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% endblock %}
 """)
 
-DASHBOARD_HTML = BASE_HTML.replace("{% block content %}{% endblock %}", """
-<div class="d-flex justify-content-between align-items-center mb-4">
-  <h2 class="mb-0"><i class="bi bi-speedometer2"></i> Dashboard</h2>
-  {% if user.role == 'department' %}
-    <a href="{{ url_for('new_requisition') }}" class="btn btn-primary">
-      <i class="bi bi-plus-circle"></i> New Requisition
-    </a>
-  {% else %}
-    <a href="{{ url_for('admin_requisitions') }}" class="btn btn-warning">
-      <i class="bi bi-shield-check"></i> Manage Requisitions
-    </a>
-  {% endif %}
-</div>
+FORM_TEMPLATE = BASE_TEMPLATE.replace("{% block content %}{% endblock %}", """
+{% block content %}
+<h2>{{ 'Edit' if req else 'New' }} Requisition</h2>
+<form method="post" style="max-width:600px;background:#fff;padding:20px;border-radius:6px;">
+    <label>Item Name *</label><br>
+    <input name="item_name" required style="width:100%;" value="{{ req.item_name if req else '' }}"><br><br>
 
-<div class="row g-3 mb-4">
-  <div class="col-6 col-md-3">
-    <div class="card border-0 shadow-sm stat-card stat-warning">
-      <div class="card-body d-flex justify-content-between align-items-center">
-        <div>
-          <div class="text-uppercase small text-muted">PENDING</div>
-          <div class="fs-3 fw-bold">{{ stats["PENDING"] }}</div>
-        </div>
-        <i class="bi bi-hourglass-split fs-1 opacity-50"></i>
-      </div>
-    </div>
-  </div>
-  
-  <div class="col-6 col-md-3">
-    <div class="card border-0 shadow-sm stat-card stat-success">
-      <div class="card-body d-flex justify-content-between align-items-center">
-        <div>
-          <div class="text-uppercase small text-muted">APPROVED</div>
-          <div class="fs-3 fw-bold">{{ stats["APPROVED"] }}</div>
-        </div>
-        <i class="bi bi-check-circle fs-1 opacity-50"></i>
-      </div>
-    </div>
-  </div>
+    <label>Description</label><br>
+    <textarea name="description" rows="3" style="width:100%;">{{ req.description if req else '' }}</textarea><br><br>
 
-  <div class="col-6 col-md-3">
-    <div class="card border-0 shadow-sm stat-card stat-danger">
-      <div class="card-body d-flex justify-content-between align-items-center">
-        <div>
-          <div class="text-uppercase small text-muted">REJECTED</div>
-          <div class="fs-3 fw-bold">{{ stats["REJECTED"] }}</div>
-        </div>
-        <i class="bi bi-x-circle fs-1 opacity-50"></i>
-      </div>
-    </div>
-  </div>
+    <label>Quantity *</label><br>
+    <input name="quantity" type="number" min="1" required style="width:100%;" value="{{ req.quantity if req else 1 }}"><br><br>
 
-  <div class="col-6 col-md-3">
-    <div class="card border-0 shadow-sm stat-card stat-primary">
-      <div class="card-body d-flex justify-content-between align-items-center">
-        <div>
-          <div class="text-uppercase small text-muted">FULFILLED</div>
-          <div class="fs-3 fw-bold">{{ stats["FULFILLED"] }}</div>
-        </div>
-        <i class="bi bi-box-seam fs-1 opacity-50"></i>
-      </div>
-    </div>
-  </div>
-</div>
+    <label>Department</label><br>
+    <input name="department" style="width:100%;" value="{{ req.department if req else '' }}"><br><br>
 
-<div class="card border-0 shadow-sm">
-  <div class="card-header bg-white py-3">
-    <h5 class="mb-0">
-      <i class="bi bi-list-ul"></i>
-      {% if user.role == 'department' %}My Requisitions{% else %}All Requisitions{% endif %}
-    </h5>
-  </div>
-  <div class="table-responsive">
-    <table class="table table-hover align-middle mb-0">
-      <thead class="table-light">
-        <tr>
-          <th>#</th><th>Item</th><th>Qty</th>
-          {% if user.role == 'admin' %}<th>Requester</th>{% endif %}
-          <th>Department</th><th>Status</th><th>Created</th><th>Justification</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for r in requisitions %}
-        <tr>
-          <td class="text-muted">#{{ r.id }}</td>
-          <td class="fw-semibold">{{ r.item }}</td>
-          <td>{{ r.quantity }}</td>
-          {% if user.role == 'admin' %}<td>{{ r.requester }}</td>{% endif %}
-          <td><span class="badge bg-secondary">{{ r.department }}</span></td>
-          <td><span class="badge status-{{ r.status|lower }}"><i class="bi bi-dot"></i>{{ r.status }}</span></td>
-          <td class="text-muted small">{{ r.created_at }}</td>
-          <td class="text-muted small">{{ r.justification or '—' }}</td>
-        </tr>
-        {% else %}
-        <tr><td colspan="8" class="text-center text-muted py-4">
-          <i class="bi bi-inbox fs-3 d-block mb-2"></i>No requisitions yet.
-        </td></tr>
+    <label>Requested By</label><br>
+    <input name="requested_by" style="width:100%;" value="{{ req.requested_by if req else session.get('username','') }}"><br><br>
+
+    <label>Priority</label><br>
+    <select name="priority" style="width:100%;">
+        {% for p in ['Normal','High','Urgent'] %}
+        <option value="{{ p }}" {% if req and req.priority == p %}selected{% endif %}>{{ p }}</option>
         {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</div>
-""")
+    </select><br><br>
 
-NEW_REQ_HTML = BASE_HTML.replace("{% block content %}{% endblock %}", """
-<div class="row justify-content-center">
-  <div class="col-md-7 col-lg-6">
-    <div class="card shadow border-0 mt-3">
-      <div class="card-body p-4">
-        <h3 class="mb-1"><i class="bi bi-plus-circle"></i> New Requisition</h3>
-        <p class="text-muted">Department: <strong>{{ user.department }}</strong></p>
-        <form method="post">
-          <div class="mb-3">
-            <label class="form-label">Item</label>
-            <input type="text" name="item" class="form-control" required autofocus>
-          </div>
-          <div class="mb-3">
-            <label class="form-label">Quantity</label>
-            <input type="number" name="quantity" min="1" class="form-control" required>
-          </div>
-          <div class="mb-3">
-            <label class="form-label">Justification <span class="text-muted">(optional)</span></label>
-            <textarea name="justification" rows="3" class="form-control"></textarea>
-          </div>
-          <div class="d-flex gap-2">
-            <a href="{{ url_for('dashboard') }}" class="btn btn-outline-secondary">
-              <i class="bi bi-arrow-left"></i> Cancel
-            </a>
-            <button class="btn btn-primary flex-grow-1">
-              <i class="bi bi-send"></i> Submit
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
-  </div>
-</div>
-""")
-
-ADMIN_REQS_HTML = BASE_HTML.replace("{% block content %}{% endblock %}", """
-<div class="d-flex justify-content-between align-items-center mb-4">
-  <h2 class="mb-0"><i class="bi bi-shield-check"></i> Manage Requisitions</h2>
-</div>
-
-<div class="mb-3 d-flex flex-wrap gap-2">
-  <a href="{{ url_for('admin_requisitions') }}"
-     class="btn btn-sm {{ 'btn-primary' if not current_status else 'btn-outline-primary' }}">
-    <i class="bi bi-list"></i> All
-  </a>
-  {% for st in ['PENDING','APPROVED','REJECTED','FULFILLED'] %}
-    <a href="{{ url_for('admin_requisitions', status=st) }}"
-       class="btn btn-sm {{ 'btn-primary' if current_status == st else 'btn-outline-primary' }}">
-      {{ st }} ({{ stats[st] }})
-    </a>
-  {% endfor %}
-</div>
-
-<div class="card border-0 shadow-sm">
-  <div class="table-responsive">
-    <table class="table table-hover align-middle mb-0">
-      <thead class="table-light">
-        <tr>
-          <th>#</th><th>Requester</th><th>Department</th>
-          <th>Item</th><th>Qty</th><th>Status</th><th>Created</th>
-          <th class="text-end">Actions</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for r in requisitions %}
-        <tr>
-          <td class="text-muted">#{{ r.id }}</td>
-          <td>{{ r.requester }}</td>
-          <td><span class="badge bg-secondary">{{ r.department }}</span></td>
-          <td class="fw-semibold">{{ r.item }}</td>
-          <td>{{ r.quantity }}</td>
-          <td><span class="badge status-{{ r.status|lower }}"><i class="bi bi-dot"></i>{{ r.status }}</span></td>
-          <td class="text-muted small">{{ r.created_at }}</td>
-          <td class="text-end">
-            {% if r.status == 'PENDING' %}
-              <form method="post" class="d-inline"
-                    action="{{ url_for('admin_action', req_id=r.id, action='approve') }}">
-                <button class="btn btn-sm btn-success">
-                  <i class="bi bi-check-lg"></i> Approve
-                </button>
-              </form>
-              <form method="post" class="d-inline"
-                    action="{{ url_for('admin_action', req_id=r.id, action='reject') }}">
-                <button class="btn btn-sm btn-outline-danger">
-                  <i class="bi bi-x-lg"></i> Reject
-                </button>
-              </form>
-            {% elif r.status == 'APPROVED' %}
-              <form method="post" class="d-inline"
-                    action="{{ url_for('admin_action', req_id=r.id, action='fulfill') }}">
-                <button class="btn btn-sm btn-primary">
-                  <i class="bi bi-box-seam"></i> Fulfill
-                </button>
-              </form>
-            {% else %}
-              <span class="text-muted small">
-                by {{ r.decided_by or '—' }}<br>{{ r.decided_at or '' }}
-              </span>
-            {% endif %}
-          </td>
-        </tr>
-        {% else %}
-        <tr><td colspan="8" class="text-center text-muted py-4">
-          <i class="bi bi-inbox fs-3 d-block mb-2"></i>No requisitions found.
-        </td></tr>
+    <label>Status</label><br>
+    <select name="status" style="width:100%;">
+        {% for s in ['Pending','Approved','Rejected'] %}
+        <option value="{{ s }}" {% if req and req.status == s %}selected{% endif %}>{{ s }}</option>
         {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</div>
+    </select><br><br>
+
+    <button type="submit">Save</button>
+    <a href="{{ url_for('index') }}"><button type="button" class="secondary">Cancel</button></a>
+</form>
+{% endblock %}
 """)
 
+USERS_TEMPLATE = BASE_TEMPLATE.replace("{% block content %}{% endblock %}", """
+{% block content %}
+<h2>Users</h2>
+<form method="post" action="{{ url_for('add_user') }}" style="background:#fff;padding:16px;border-radius:6px;margin-bottom:16px;">
+    <div class="filter-grid">
+        <div><label>Username</label><input name="username" required></div>
+        <div><label>Password</label><input name="password" type="password" required></div>
+        <div><label>Role</label>
+            <select name="role"><option value="user">user</option><option value="admin">admin</option></select>
+        </div>
+        <div><label>Department</label><input name="department"></div>
+        <div><button type="submit">Add User</button></div>
+    </div>
+</form>
 
-# =========================================================
-# TEMPLATE CONTEXT
-# =========================================================
-@app.context_processor
-def inject_user():
-    return {"user": current_user()}
+<table>
+    <thead><tr><th>ID</th><th>Username</th><th>Role</th><th>Department</th><th>Actions</th></tr></thead>
+    <tbody>
+    {% for u in users %}
+        <tr>
+            <td>{{ u.id }}</td>
+            <td>{{ u.username }}</td>
+            <td>{{ u.role }}</td>
+            <td>{{ u.department }}</td>
+            <td>
+                {% if u.username != 'admin' %}
+                <form method="post" action="{{ url_for('delete_user', user_id=u.id) }}" onsubmit="return confirm('Delete user?');">
+                    <button class="danger">Delete</button>
+                </form>
+                {% endif %}
+            </td>
+        </tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% endblock %}
+""")
 
 
 # =========================================================
 # ROUTES
 # =========================================================
-@app.route("/")
-def index():
-    return redirect(url_for("dashboard") if current_user() else url_for("login"))
-
-
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        u = request.form["username"].strip()
-        p = request.form["password"]
-        user = db_login(u, p)
-        if user:
-            session["user"] = user
-            flash(f"Welcome back, {user['username']}!", "success")
-            return redirect(url_for("dashboard"))
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        db = get_db()
+        user = db.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        if user and user["password"] == hash_password(password):
+            session["user_id"] = user["id"]
+            session["username"] = user["username"]
+            session["role"] = user["role"]
+            flash(f"Welcome, {user['username']}!", "success")
+            return redirect(url_for("index"))
         flash("Invalid username or password.", "danger")
-    return render_template_string(LOGIN_HTML)
-
-
-@app.route("/register", methods=["GET", "POST"])
-def register():
-    if request.method == "POST":
-        username = request.form["username"].strip()
-        password = request.form["password"]
-        role = request.form["role"]
-        department = (request.form.get("department") or "").strip() or None
-        if role == "department" and not department:
-            flash("Department is required for department users.", "warning")
-        elif db_register(username, password, role, department):
-            flash("Account created — you can log in now.", "success")
-            return redirect(url_for("login"))
-        else:
-            flash("Username already taken.", "danger")
-    return render_template_string(REGISTER_HTML)
+    return render_template_string(LOGIN_TEMPLATE)
 
 
 @app.route("/logout")
 def logout():
     session.clear()
-    flash("Logged out.", "info")
+    flash("Logged out.", "success")
     return redirect(url_for("login"))
 
 
-@app.route("/dashboard")
+@app.route("/")
 @login_required
-def dashboard():
-    u = current_user()
-    scope = u["department"] if u["role"] == "department" else None
-    reqs = db_list_requisitions(department=scope)
-    s = db_stats(department=scope)
-    return render_template_string(DASHBOARD_HTML, requisitions=reqs, stats=s)
+def index():
+    db = get_db()
 
+    # ---- Read filter params ----
+    f = {
+        "item": request.args.get("f_item", "").strip(),
+        "desc": request.args.get("f_desc", "").strip(),
+        "dept": request.args.get("f_dept", "").strip(),
+        "requester": request.args.get("f_requester", "").strip(),
+        "status": request.args.get("f_status", "").strip(),
+        "priority": request.args.get("f_priority", "").strip(),
+        "qty_min": request.args.get("f_qty_min", "").strip(),
+        "qty_max": request.args.get("f_qty_max", "").strip(),
+        "date_from": request.args.get("f_date_from", "").strip(),
+        "date_to": request.args.get("f_date_to", "").strip(),
+        "sort": request.args.get("sort", "created_at"),
+        "order": request.args.get("order", "desc"),
+    }
 
-@app.route("/requisition/new", methods=["GET", "POST"])
-@login_required
-def new_requisition():
-    u = current_user()
-    if u["role"] != "department":
-        flash("Only department users can create requisitions.", "warning")
-        return redirect(url_for("dashboard"))
-    if request.method == "POST":
-        item = request.form["item"].strip()
+    # ---- Build WHERE clause dynamically ----
+    where, params = [], []
+
+    if f["item"]:
+        where.append("LOWER(item_name) LIKE ?")
+        params.append(f"%{f['item'].lower()}%")
+    if f["desc"]:
+        where.append("LOWER(description) LIKE ?")
+        params.append(f"%{f['desc'].lower()}%")
+    if f["dept"]:
+        where.append("department = ?")
+        params.append(f["dept"])
+    if f["requester"]:
+        where.append("requested_by = ?")
+        params.append(f["requester"])
+    if f["status"]:
+        where.append("status = ?")
+        params.append(f["status"])
+    if f["priority"]:
+        where.append("priority = ?")
+        params.append(f["priority"])
+    if f["qty_min"]:
         try:
-            qty = int(request.form["quantity"])
+            where.append("quantity >= ?")
+            params.append(int(f["qty_min"]))
         except ValueError:
-            flash("Quantity must be a number.", "danger")
-            return redirect(url_for("new_requisition"))
-        justification = request.form.get("justification", "").strip()
-        if not item or qty <= 0:
-            flash("Please provide a valid item and quantity.", "danger")
-        else:
-            db_create_requisition(u["username"], u["department"], item, qty, justification)
-            flash("Requisition submitted.", "success")
-            return redirect(url_for("dashboard"))
-    return render_template_string(NEW_REQ_HTML)
+            pass
+    if f["qty_max"]:
+        try:
+            where.append("quantity <= ?")
+            params.append(int(f["qty_max"]))
+        except ValueError:
+            pass
+    if f["date_from"]:
+        where.append("DATE(created_at) >= DATE(?)")
+        params.append(f["date_from"])
+    if f["date_to"]:
+        where.append("DATE(created_at) <= DATE(?)")
+        params.append(f["date_to"])
 
+    # ---- Whitelist sort columns ----
+    sort_columns = {
+        "id": "id",
+        "item_name": "item_name",
+        "quantity": "quantity",
+        "department": "department",
+        "requested_by": "requested_by",
+        "priority": "priority",
+        "status": "status",
+        "created_at": "created_at",
+    }
+    sort_col = sort_columns.get(f["sort"], "created_at")
+    order = "ASC" if f["order"].lower() == "asc" else "DESC"
 
-@app.route("/admin/requisitions")
-@admin_required
-def admin_requisitions():
-    status = request.args.get("status") or None
-    reqs = db_list_requisitions(status=status)
-    s = db_stats()
+    sql = "SELECT * FROM requisitions"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += f" ORDER BY {sort_col} {order}"
+
+    requisitions = db.execute(sql, params).fetchall()
+
+    # ---- Build dropdown options from existing data ----
+    options = {
+        "departments": [row["department"] for row in
+                        db.execute("SELECT DISTINCT department FROM requisitions WHERE department != '' ORDER BY department")],
+        "requesters": [row["requested_by"] for row in
+                       db.execute("SELECT DISTINCT requested_by FROM requisitions WHERE requested_by != '' ORDER BY requested_by")],
+        "statuses": ["Pending", "Approved", "Rejected"],
+        "priorities": ["Normal", "High", "Urgent"],
+    }
+
+    sort_options = [
+        ("created_at", "Date Created"),
+        ("item_name", "Item Name"),
+        ("quantity", "Quantity"),
+        ("department", "Department"),
+        ("requested_by", "Requested By"),
+        ("priority", "Priority"),
+        ("status", "Status"),
+        ("id", "ID"),
+    ]
+
+    has_filters = any([f["item"], f["desc"], f["dept"], f["requester"],
+                       f["status"], f["priority"], f["qty_min"], f["qty_max"],
+                       f["date_from"], f["date_to"]])
+
     return render_template_string(
-        ADMIN_REQS_HTML, requisitions=reqs, stats=s, current_status=status
+        INDEX_TEMPLATE,
+        requisitions=requisitions,
+        f=f,
+        options=options,
+        sort_options=sort_options,
+        has_filters=has_filters,
     )
 
 
-@app.route("/admin/requisitions/<int:req_id>/<action>", methods=["POST"])
+@app.route("/add", methods=["GET", "POST"])
+@login_required
+def add_requisition():
+    if request.method == "POST":
+        db = get_db()
+        db.execute("""
+            INSERT INTO requisitions
+            (item_name, description, quantity, department, requested_by, priority, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            request.form["item_name"].strip(),
+            request.form.get("description", "").strip(),
+            int(request.form.get("quantity", 1)),
+            request.form.get("department", "").strip(),
+            request.form.get("requested_by", "").strip(),
+            request.form.get("priority", "Normal"),
+            request.form.get("status", "Pending"),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ))
+        db.commit()
+        flash("Requisition created.", "success")
+        return redirect(url_for("index"))
+    return render_template_string(FORM_TEMPLATE, req=None)
+
+
+@app.route("/edit/<int:req_id>", methods=["GET", "POST"])
+@login_required
+def edit_requisition(req_id):
+    db = get_db()
+    req = db.execute("SELECT * FROM requisitions WHERE id = ?", (req_id,)).fetchone()
+    if not req:
+        abort(404)
+
+    if request.method == "POST":
+        db.execute("""
+            UPDATE requisitions
+            SET item_name=?, description=?, quantity=?, department=?,
+                requested_by=?, priority=?, status=?
+            WHERE id=?
+        """, (
+            request.form["item_name"].strip(),
+            request.form.get("description", "").strip(),
+            int(request.form.get("quantity", 1)),
+            request.form.get("department", "").strip(),
+            request.form.get("requested_by", "").strip(),
+            request.form.get("priority", "Normal"),
+            request.form.get("status", "Pending"),
+            req_id,
+        ))
+        db.commit()
+        flash("Requisition updated.", "success")
+        return redirect(url_for("index"))
+
+    return render_template_string(FORM_TEMPLATE, req=req)
+
+
+@app.route("/delete/<int:req_id>", methods=["POST"])
+@login_required
 @admin_required
-def admin_action(req_id, action):
-    u = current_user()
-    if action == "approve":
-        db_set_status(req_id, "APPROVED", u["username"])
-        flash(f"Requisition #{req_id} approved.", "success")
-    elif action == "reject":
-        db_set_status(req_id, "REJECTED", u["username"])
-        flash(f"Requisition #{req_id} rejected.", "danger")
-    elif action == "fulfill":
-        req = db_get_requisition(req_id)
-        if req and req["status"] == "APPROVED":
-            db_set_status(req_id, "FULFILLED", u["username"])
-            flash(f"Requisition #{req_id} fulfilled.", "primary")
-        else:
-            flash("Only approved requisitions can be fulfilled.", "warning")
-    else:
-        abort(400)
-    return redirect(request.referrer or url_for("admin_requisitions"))
+def delete_requisition(req_id):
+    db = get_db()
+    db.execute("DELETE FROM requisitions WHERE id = ?", (req_id,))
+    db.commit()
+    flash("Requisition deleted.", "success")
+    return redirect(url_for("index"))
 
 
 # =========================================================
-# ERROR HANDLERS
+# USERS (admin only)
 # =========================================================
-@app.errorhandler(403)
-def forbidden(_):
-    return render_template_string(
-        BASE_HTML, error_title="403 — Forbidden",
-        error_msg="You don't have permission to view this page."
-    ), 403
+@app.route("/users")
+@login_required
+@admin_required
+def users():
+    db = get_db()
+    all_users = db.execute("SELECT * FROM users ORDER BY username").fetchall()
+    return render_template_string(USERS_TEMPLATE, users=all_users)
 
 
-@app.errorhandler(404)
-def not_found(_):
-    return render_template_string(
-        BASE_HTML, error_title="404 — Not Found",
-        error_msg="The page you're looking for doesn't exist."
-    ), 404
+@app.route("/users/add", methods=["POST"])
+@login_required
+@admin_required
+def add_user():
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO users (username, password, role, department) VALUES (?, ?, ?, ?)",
+            (
+                request.form["username"].strip(),
+                hash_password(request.form["password"]),
+                request.form.get("role", "user"),
+                request.form.get("department", "").strip(),
+            ),
+        )
+        db.commit()
+        flash("User added.", "success")
+    except sqlite3.IntegrityError:
+        flash("Username already exists.", "danger")
+    return redirect(url_for("users"))
+
+
+@app.route("/users/delete/<int:user_id>", methods=["POST"])
+@login_required
+@admin_required
+def delete_user(user_id):
+    db = get_db()
+    db.execute("DELETE FROM users WHERE id = ? AND username != 'admin'", (user_id,))
+    db.commit()
+    flash("User deleted.", "success")
+    return redirect(url_for("users"))
 
 
 # =========================================================
 # MAIN
 # =========================================================
-init_db()
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    init_db()
+    app.run(debug=True)
