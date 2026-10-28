@@ -673,6 +673,9 @@ def delete_user(user_id):
 # =========================================================
 # MAIN
 # =========================================================
-if __name__ == "__main__":
+# Initialize the database when the app starts (works on Render & local)
+with app.app_context():
     init_db()
+
+if __name__ == "__main__":
     app.run(debug=True)
